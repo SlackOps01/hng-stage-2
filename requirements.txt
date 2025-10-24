@@ -1,0 +1,6 @@
+fastapi[all]
+uvicorn
+sqlalchemy
+pymysql
+cryptography
+matplotlib
