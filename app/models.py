@@ -2,6 +2,7 @@ from .database import Base
 from sqlalchemy import Column, String, DateTime, Float, Integer
 from uuid import uuid4
 from sqlalchemy.sql import func
+from datetime import datetime, timezone
 
 
 class Countries(Base):
@@ -16,5 +17,10 @@ class Countries(Base):
     estimated_gdp = Column(Float)
     flag_url = Column(String(255))
     last_refreshed_at = Column(DateTime(timezone=True), nullable=True)
+
+class RefreshMeta(Base):
+    __tablename__ = "refresh_meta"
+    id = Column(Integer, primary_key=True)
+    last_refreshed_at = Column(DateTime, nullable=False, default=datetime.now(timezone.utc))
 
 

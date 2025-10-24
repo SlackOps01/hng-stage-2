@@ -7,10 +7,13 @@ from .schemas import Country
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from random import randrange
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import desc
 import os
 import matplotlib
+import matplotlib.pyplot as plt
+from sqlalchemy.sql import func
+
 
 
 matplotlib.use("Agg")
@@ -34,13 +37,13 @@ def generate_summary_image(db: Session):
     top_names = [c.name for c in top_countries]
     top_gdps = [c.estimated_gdp for c in top_countries]
     last_refresh = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    matplotlib.pyplot.figure(figsize=(10,6))
-    matplotlib.pyplot.bar(top_names, top_gdps, color='skyblue')
-    matplotlib.pyplot.title(f"Top 5 Countries by Estimated GDP\nTotal Countries: {total_countries}\nLast Refresh: {last_refresh}")
-    matplotlib.pyplot.ylabel("Estimated GDP")
-    matplotlib.pyplot.tight_layout()
-    matplotlib.pyplot.savefig("cache/summary.png")
-    matplotlib.pyplot.close()
+    plt.figure(figsize=(10,6))
+    plt.bar(top_names, top_gdps, color='skyblue')
+    plt.title(f"Top 5 Countries by Estimated GDP\nTotal Countries: {total_countries}\nLast Refresh: {last_refresh}")
+    plt.ylabel("Estimated GDP")
+    plt.tight_layout()
+    plt.savefig("cache/summary.png")
+    plt.close()
 
 def parse_countries(country: dict, exchange_data):
     name = country['name']['common']
@@ -60,7 +63,7 @@ def parse_countries(country: dict, exchange_data):
         exchange_rate = None
     flag_url = country['flags']['png']
     if exchange_rate is None:
-        estimated_gdp = None
+        estimated_gdp = 0
     else:
         estimated_gdp = (country['population']*randrange(1000,2000)) / exchange_rate
 
@@ -73,7 +76,6 @@ def parse_countries(country: dict, exchange_data):
         'estimated_gdp': estimated_gdp,
         'flag_url': flag_url,
         "exchange_rate": exchange_rate,
-        "last_refreshed_at":datetime.now()
     }
     return data
 
@@ -85,25 +87,57 @@ def home():
 
 @app.post("/countries/refresh")
 def refresh_countries(db: Session = Depends(get_db)):
+    try:
+        countries_resp = httpx.get(
+            "https://restcountries.com/v3.1/all?fields=name,capital,region,population,currencies,flags",
+            timeout=15.0,
+        )
+        countries_resp.raise_for_status()
 
-    data = httpx.get("https://restcountries.com/v3.1/all?fields=name,capital,region,population,currencies,flags")
-    exchange_data = httpx.get("https://open.er-api.com/v6/latest/USD")
-    exchange_data = exchange_data.json()
-    data_json =  data.json()
-    for country in data_json:
-        data = parse_countries(country, exchange_data)
-        new_country = models.Countries(**data)
-        db.add(new_country)
-        try:   
-            db.commit()
+        exchange_resp = httpx.get("https://open.er-api.com/v6/latest/USD", timeout=10.0)
+        exchange_resp.raise_for_status()
+    except httpx.RequestError as e:
+        api = "Countries" if "restcountries" in str(e) else "Exchange"
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "External data source unavailable",
+                "details": f"Could not fetch data from {api} API",
+            },
+        )
 
-        
-        except IntegrityError:
-            db.rollback()
-            print(f"skipping {country['name']}")
+    countries = countries_resp.json()
+    rates = exchange_resp.json().get("rates", {})
+    refresh_time = datetime.now()
+
+    for country in countries:
+        data = parse_countries(country, rates)
+        if not data["name"] or not data["population"]:
+            continue
+        data["last_refreshed_at"] = refresh_time
+
+        existing = db.query(models.Countries).filter(
+            func.lower(models.Countries.name) == data["name"].lower()
+        ).first()
+
+        if existing:
+            for k, v in data.items():
+                setattr(existing, k, v)
+        else:
+            db.add(models.Countries(**data))
+
+    db.commit()
+
+    meta = db.query(models.RefreshMeta).first()
+    if meta:
+        meta.last_refreshed_at = refresh_time
+    else:
+        db.add(models.RefreshMeta(last_refreshed_at=refresh_time))
+    db.commit()
+
     generate_summary_image(db)
-    return {"message": "done"} 
-
+    return {"message": "Cache refreshed", "refreshed_at": refresh_time.isoformat() + "Z"}
+  
 @app.get("/countries")
 def get_countries(
     region: str | None = Query(None, description="Filter by region, e.g. Africa"),
@@ -111,14 +145,6 @@ def get_countries(
     sort: str = Query("gdp_desc", description="Sort by gdp_desc, gdp_asc, population_desc, population_asc, name_asc, name_desc"),
     db: Session = Depends(get_db)
 ):
-    # Manual validation for required fields
-    missing = {}
-    if not region:
-        missing["region"] = "is required"
-    if not currency:
-        missing["currency"] = "is required"
-    if missing:
-        raise HTTPException(status_code=400, detail={"error": "Validation failed", "details": missing})
 
     # Validate sort
     if sort.lower() not in VALID_SORTS:
@@ -129,8 +155,10 @@ def get_countries(
 
     query = db.query(models.Countries)
     # Filters
-    query = query.filter(models.Countries.region.ilike(region))
-    query = query.filter(models.Countries.currency_code == currency)
+    if region:
+        query = query.filter(models.Countries.region.ilike(region))
+    if currency:   
+        query = query.filter(models.Countries.currency_code == currency)
 
     # Sorting
     if sort.lower() == "gdp_desc":
@@ -162,7 +190,7 @@ def get_summary_image():
 @app.get("/countries/{name}")
 def get_country(name: str, db: Session = Depends(get_db)):
     name = name.lower()
-    country = db.query(models.Countries).where(models.Countries.name==name).first()
+    country = db.query(models.Countries).where(models.Countries.name.ilike(f"{name}")).first()
     if country is None:
         raise HTTPException(
             status_code=404,
@@ -173,16 +201,16 @@ def get_country(name: str, db: Session = Depends(get_db)):
 @app.get("/status")
 def get_status(db: Session = Depends(get_db)):
     countries_count = db.query(models.Countries).count()
-    last_timestamp = db.query(models.Countries).order_by(desc(models.Countries.last_refreshed_at)).first().last_refreshed_at
+    meta = db.query(models.RefreshMeta).first()
+    last_ts = meta.last_refreshed_at.isoformat() + "Z" if meta else None
     return{
-        "count": countries_count,
-        "last_timestamp":last_timestamp
+        "total_countries": countries_count,
+        "last_refreshed_at":last_ts
     }
 
 @app.delete("/countries/{name}")
 def delete_country(name: str, db: Session = Depends(get_db)):
-    name = name.lower()
-    country = db.query(models.Countries).where(models.Countries.name==name).first()
+    country = db.query(models.Countries).where(models.Countries.name.ilike(f"{name}")).first()
     if country is None:
         raise HTTPException(
             status_code=404,
@@ -193,12 +221,3 @@ def delete_country(name: str, db: Session = Depends(get_db)):
     return {
         "message": "deleted"
     }
-
-@app.get("/countries/image")
-def get_summary_image():
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    image_path = os.path.join(project_root, "cache", "summary.png")
-
-    if not os.path.exists(image_path):
-        return {"error":"Summary image not found"}
-    return FileResponse(image_path, media_type="image/png")
